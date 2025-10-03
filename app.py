@@ -41,6 +41,8 @@ client = MongoClient(MONGODB_URI)
 db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
 
+app = Flask(__name__)
+
 # Global variables
 df = pd.DataFrame()
 clf = None
@@ -85,11 +87,10 @@ else:
 # ------------- Utilities -------------
 
 def aggregate_monthly(df_sub):
-    # Aggregate monthly Quantity and Unit Price, compute Revenue proxy
     monthly = df_sub.resample('MS', on='timestamp').agg({
         'Quantity_Sold': 'sum',
         'Unit_Price': 'mean',
-        'Rating': 'mean'  # Added for ratings aggregation
+        'Rating': 'mean'
     }).reset_index()
     monthly['Revenue'] = (monthly['Quantity_Sold'].fillna(0) * monthly['Unit_Price'].fillna(0)).astype(float)
     return monthly[['timestamp', 'Quantity_Sold', 'Revenue', 'Rating']]
@@ -121,7 +122,7 @@ def rating_distribution(df_sub):
     ratings = df_sub['Rating'].dropna().astype(int)
     if len(ratings) == 0:
         return {'bins': [], 'values': []}
-    hist, bins = np.histogram(ratings, bins=range(1, 7))  # Assuming ratings 1-5
+    hist, bins = np.histogram(ratings, bins=range(1, 7))  
     return {
         'bins': [f"{i}-{i+1}" for i in range(1, 6)],
         'values': hist.tolist()
@@ -145,7 +146,7 @@ def ratings_vs_sales_scatter(df_sub):
 def top_rated_products(df_sub):
     grouped = df_sub.groupby(['Brand', 'Product_Name', 'Model']).agg({
         'Rating': 'mean',
-        'Quantity_Sold': 'count'  # For weighting if needed
+        'Quantity_Sold': 'count'  
     }).reset_index()
     grouped = grouped.sort_values('Rating', ascending=False).head(10)
     labels = grouped.apply(lambda row: f"{row['Brand']} {row['Product_Name']} ({row['Model']})", axis=1).tolist()
@@ -183,18 +184,15 @@ def sentiment_breakdown(df_sub):
 # ------------- ML Utilities for Buy/Not Buy -------------
 
 def prepare_ml_data(df):
-    """Simplified feature engineering with consistent features"""
     if df.empty:
         return None, None, None, None
     
     df_ml = df.dropna(subset=['Rating', 'Quantity_Sold']).copy()
-    if len(df_ml) < 10:  # Need minimum samples
+    if len(df_ml) < 10:  
         return None, None, None, None
     
-    # Target variable: Buy if rating >= 4
     df_ml['Buy'] = (df_ml['Rating'] >= 4).astype(int)
     
-    # Use only basic features for consistency
     feature_cols = ['Rating', 'Quantity_Sold']
     
     X = df_ml[feature_cols]
@@ -203,7 +201,6 @@ def prepare_ml_data(df):
     return train_test_split(X, y, test_size=0.3, random_state=42)
 
 def train_buy_classifier():
-    """Train the buy/not buy classifier with basic features"""
     global clf, df
     
     if df.empty:
@@ -212,7 +209,7 @@ def train_buy_classifier():
     
     try:
         result = prepare_ml_data(df)
-        if result[0] is None:  # Not enough data
+        if result[0] is None:  
             logger.warning("Not enough data to train ML model.")
             return False
         
@@ -222,7 +219,6 @@ def train_buy_classifier():
             logger.warning("Insufficient training samples.")
             return False
         
-        # Train RandomForest with basic parameters
         clf = RandomForestClassifier(
             n_estimators=50,
             random_state=42,
@@ -235,7 +231,6 @@ def train_buy_classifier():
         
         logger.info(f"[ML] Buy Classifier trained with accuracy: {acc:.2f}")
         
-        # Save model
         joblib.dump(clf, "buy_classifier.joblib")
         logger.info("[ML] Model saved to buy_classifier.joblib")
         
@@ -246,64 +241,52 @@ def train_buy_classifier():
         return False
 
 def load_or_train_classifier():
-    """Load existing model or train new one"""
     global clf
     
     try:
-        # Try loading existing model first
         clf = joblib.load("buy_classifier.joblib")
         logger.info("[ML] Loaded existing buy classifier")
         return True
     except FileNotFoundError:
-        # Train new model if none exists
         success = train_buy_classifier()
         if success:
             logger.info("[ML] Trained new buy classifier")
         return success
     except Exception as e:
         logger.error(f"Error loading ML model: {e}")
-        # Fallback to training new model
         return train_buy_classifier()
 
 def get_buy_prediction(sub, user_budget=None, user_priority='balanced'):
-    """Generate buy prediction with consistent features"""
     global clf, df
     
     if clf is None or sub.empty:
         return None, 'Model not available'
     
     try:
-        # Calculate only basic features
         avg_rating = sub['Rating'].mean()
         total_qty = sub['Quantity_Sold'].sum()
         
-        # Validate features
         if pd.isna(avg_rating) or pd.isna(total_qty):
             return None, 'Insufficient data for prediction'
         
-        # Prepare features for prediction (matching training features)
         X_pred = pd.DataFrame({
             'Rating': [avg_rating],
             'Quantity_Sold': [total_qty]
         })
         
-        # Get base prediction
         buy_prob = clf.predict_proba(X_pred)[0][1]
         
-        # Apply personalization adjustments
         if user_priority == 'rating' and avg_rating >= 4.0:
-            buy_prob = min(1.0, buy_prob + 0.1)  # Boost for high ratings
+            buy_prob = min(1.0, buy_prob + 0.1)  
         elif user_priority == 'value' and user_budget and 'Unit_Price' in sub.columns:
             avg_price = sub['Unit_Price'].mean()
             if avg_price < user_budget:
-                buy_prob = min(1.0, buy_prob + 0.15)  # Boost for good value
+                buy_prob = min(1.0, buy_prob + 0.15)  
         elif user_priority == 'popularity' and total_qty > df['Quantity_Sold'].quantile(0.75):
-            buy_prob = min(1.0, buy_prob + 0.1)  # Boost for popular items
+            buy_prob = min(1.0, buy_prob + 0.1)  
         
-        # Generate recommendation
         buy_rec = 'Buy' if buy_prob > 0.5 else 'Do not buy'
         
-        # Add budget consideration
         if user_budget and 'Unit_Price' in sub.columns:
             avg_price = sub['Unit_Price'].mean()
             if avg_price > user_budget:
@@ -315,11 +298,9 @@ def get_buy_prediction(sub, user_budget=None, user_priority='balanced'):
         logger.error(f"Error in buy prediction: {e}")
         return None, 'Prediction failed'
 
-# Initialize ML model
 load_or_train_classifier()
 
 # ------------- Forecast Models -------------
-
 def holt_winters_forecast(monthly_sales, steps):
     y = monthly_sales['Quantity_Sold']
     if len(monthly_sales) >= 24 and y.sum() > 0:
@@ -430,9 +411,11 @@ def select_best_model(monthly_sales, steps=6):
 
 # ---------------- Routes ----------------
 
+@app.route('/')
 def index():
     return render_template('index.html', brands=brands, min_date=min_date_str, max_date=max_date_str)
 
+@app.route('/api/products/<brand>')
 def get_products_for_brand(brand):
     if df.empty:
         return jsonify([])
@@ -440,6 +423,7 @@ def get_products_for_brand(brand):
     products = subset['Product_Name'].dropna().astype(str).unique().tolist()
     return jsonify(sorted(products))
 
+@app.route('/api/models/<brand>/<product>')
 def get_models_for_product(brand, product):
     if df.empty:
         return jsonify([])
@@ -450,14 +434,13 @@ def get_models_for_product(brand, product):
     models = subset['Model'].dropna().astype(str).unique().tolist()
     return jsonify(sorted(models))
 
+@app.route('/api/forecast', methods=['POST'])
 def forecast_api():
     global df, data_version
     try:
-        # Check if data needs reloading
         old_version = data_version
         df = load_sales_data()
         
-        # Retrain model if data changed
         if data_version != old_version:
             load_or_train_classifier()
 
@@ -502,7 +485,6 @@ def forecast_api():
         last_date = monthly['timestamp'].iloc[-1]
         f_dates = pd.date_range(last_date + pd.offsets.MonthBegin(1), periods=steps, freq='MS')
 
-        # Revenue forecast proxy: mean Unit_Price of selected data
         last_price_series = sub['Unit_Price'].dropna().astype(float)
         price_proxy = float(last_price_series.mean()) if len(last_price_series) else 0.0
         f_revenue = (np.array(pred) * price_proxy).tolist()
@@ -536,6 +518,7 @@ def forecast_api():
         logger.exception("forecast_api error")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/model-comparison', methods=['POST'])
 def model_comparison():
     try:
         data = request.get_json() or {}
@@ -588,16 +571,13 @@ def model_comparison():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ------------- Enhanced Route for Ratings Graphs -------------
-
+@app.route('/api/ratings', methods=['POST'])
 def ratings_api():
     global df, clf, data_version
     try:
-        # Check if data needs reloading
         old_version = data_version
         df = load_sales_data()
         
-        # Retrain model if data changed
         if data_version != old_version:
             load_or_train_classifier()
 
@@ -606,7 +586,6 @@ def ratings_api():
             if not data.get(k):
                 return jsonify({'error': f'Missing field: {k}'}), 400
 
-        # Get personalization inputs
         user_budget = float(data.get('budget', 0)) if data.get('budget') else None
         user_priority = data.get('priority', 'balanced')
 
@@ -638,7 +617,6 @@ def ratings_api():
             'sentiment_breakdown': sentiment_breakdown(sub)
         }
 
-        # Get buy prediction
         buy_prob, buy_rec = get_buy_prediction(sub, user_budget, user_priority)
         
         if buy_prob is not None:
@@ -652,16 +630,13 @@ def ratings_api():
         logger.exception("ratings_api error")
         return jsonify({'error': str(e)}), 500
 
-# ------------- New Route for Combined Recommendation -------------
-
+@app.route('/api/recommendation', methods=['POST'])
 def recommendation_api():
     global df, clf, data_version
     try:
-        # Check if data needs reloading
         old_version = data_version
         df = load_sales_data()
         
-        # Retrain model if data changed
         if data_version != old_version:
             load_or_train_classifier()
 
@@ -670,7 +645,6 @@ def recommendation_api():
             if not data.get(k):
                 return jsonify({'error': f'Missing field: {k}'}), 400
 
-        # Get personalization inputs
         user_budget = float(data.get('budget', 0)) if data.get('budget') else None
         user_priority = data.get('priority', 'balanced')
 
@@ -693,12 +667,10 @@ def recommendation_api():
         if sub.empty:
             return jsonify({'error': 'No data found for the selected criteria.'}), 400
 
-        # Forecast sales
         monthly = aggregate_monthly(sub).set_index('timestamp').asfreq('MS', fill_value=0).reset_index()
         steps = 6
         pred, chosen_model, conf, _ = select_best_model(monthly[['timestamp', 'Quantity_Sold']], steps=steps)
 
-        # Get buy prediction
         buy_prob, buy_rec = get_buy_prediction(sub, user_budget, user_priority)
 
         response = {
@@ -716,10 +688,8 @@ def recommendation_api():
         logger.exception("recommendation_api error")
         return jsonify({'error': str(e)}), 500
 
-# ---------------- Health Check Route ----------------
-
+@app.route('/api/health')
 def health_check():
-    """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
         'ml_model_loaded': clf is not None,
@@ -727,30 +697,6 @@ def health_check():
         'brands_available': len(brands)
     })
 
-# ---------------- Application Factory ----------------
-
-def create_app():
-    app = Flask(__name__)
-    
-    # Add any app configurations here
-    # For example:
-    # app.config['DEBUG'] = True
-    # app.config.from_object('config')  # If you have a config file
-
-    # Register routes using add_url_rule (since routes are defined as functions)
-    app.add_url_rule('/', view_func=index)
-    app.add_url_rule('/api/products/<brand>', view_func=get_products_for_brand)
-    app.add_url_rule('/api/models/<brand>/<product>', view_func=get_models_for_product)
-    app.add_url_rule('/api/forecast', view_func=forecast_api, methods=['POST'])
-    app.add_url_rule('/api/model-comparison', view_func=model_comparison, methods=['POST'])
-    app.add_url_rule('/api/ratings', view_func=ratings_api, methods=['POST'])
-    app.add_url_rule('/api/recommendation', view_func=recommendation_api, methods=['POST'])
-    app.add_url_rule('/api/health', view_func=health_check)
-    
-    return app
-
-# ---------------- Main ----------------
-
 if __name__ == '__main__':
-    app = create_app()
-    app.run(debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
