@@ -35,61 +35,81 @@ DB_NAME = os.environ.get("DB_NAME")
 COLLECTION_NAME = os.environ.get("COLLECTION_NAME")
 
 if not MONGODB_URI or not DB_NAME or not COLLECTION_NAME:
-    raise RuntimeError("Missing MongoDB configuration. Set MONGODB_URI, DB_NAME, and COLLECTION_NAME in environment.")
+    # We might not have MongoDB at build time but we need the app to initialize for Frozen-Flask
+    logger.warning("Missing MongoDB configuration. Ensure MONGODB_URI, DB_NAME, and COLLECTION_NAME are set in environment.")
 
-client = MongoClient(MONGODB_URI)
-db = client[DB_NAME]
-collection = db[COLLECTION_NAME]
+client = None
+db = None
+collection = None
+
+try:
+    if MONGODB_URI:
+        client = MongoClient(MONGODB_URI)
+        db = client[DB_NAME]
+        collection = db[COLLECTION_NAME]
+except Exception as e:
+    logger.error(f"Error connecting to MongoDB: {e}")
 
 # Global variables
 df = pd.DataFrame()
 clf = None
 data_version = 0  # Track data changes
+min_date_str = None
+max_date_str = None
+brands = []
 
 # ---------------- Data Loading ----------------
 
 def load_sales_data():
-    global data_version
+    global data_version, df, min_date_str, max_date_str, brands
     if client is None or db is None or collection is None:
+        logger.warning("MongoDB not connected. Returning empty DataFrame.")
         return pd.DataFrame(columns=['Brand','Product_Name','Model','timestamp','Quantity_Sold','Unit_Price','Revenue','Year','Month','Product_ID','Rating'])
     
-    records = list(collection.find({}))
-    if not records:
-        return pd.DataFrame(columns=['Brand','Product_Name','Model','timestamp','Quantity_Sold','Unit_Price','Revenue','Year','Month','Product_ID','Rating'])
-    
-    df = pd.DataFrame(records)
-    data_version += 1  # Increment version when data changes
+    try:
+        records = list(collection.find({}))
+        if not records:
+            return pd.DataFrame(columns=['Brand','Product_Name','Model','timestamp','Quantity_Sold','Unit_Price','Revenue','Year','Month','Product_ID','Rating'])
+        
+        new_df = pd.DataFrame(records)
+        data_version += 1  # Increment version when data changes
 
-    # Ensure timestamp and numeric fields
-    if 'timestamp' in df.columns:
-        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-    for col in ['Quantity_Sold','Unit_Price','Revenue','Year','Rating']:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-    return df
+        # Ensure timestamp and numeric fields
+        if 'timestamp' in new_df.columns:
+            new_df['timestamp'] = pd.to_datetime(new_df['timestamp'], errors='coerce')
+        for col in ['Quantity_Sold','Unit_Price','Revenue','Year','Rating']:
+            if col in new_df.columns:
+                new_df[col] = pd.to_numeric(new_df[col], errors='coerce')
+        
+        df = new_df
+        
+        if not df.empty and 'timestamp' in df.columns:
+            min_ts = df['timestamp'].min()
+            max_ts = df['timestamp'].max()
+            min_date_str = min_ts.strftime('%Y-%m') if pd.notnull(min_ts) else None
+            max_date_str = max_ts.strftime('%Y-%m') if pd.notnull(max_ts) else None
+            brands = sorted(df['Brand'].dropna().astype(str).unique().tolist())
+        else:
+            min_date_str = None
+            max_date_str = None
+            brands = []
+            
+        return df
+    except Exception as e:
+        logger.error(f"Error loading data from MongoDB: {e}")
+        return df
 
 # Load initial data
-df = load_sales_data()
-
-if not df.empty and 'timestamp' in df.columns:
-    min_ts = df['timestamp'].min()
-    max_ts = df['timestamp'].max()
-    min_date_str = min_ts.strftime('%Y-%m') if pd.notnull(min_ts) else None
-    max_date_str = max_ts.strftime('%Y-%m') if pd.notnull(max_ts) else None
-    brands = sorted(df['Brand'].dropna().astype(str).unique().tolist())
-else:
-    min_date_str = None
-    max_date_str = None
-    brands = []
+load_sales_data()
 
 # ------------- Utilities -------------
 
 def aggregate_monthly(df_sub):
-    # Aggregate monthly Quantity and Unit Price, compute Revenue proxy
+    """Aggregate monthly Quantity and Unit Price, compute Revenue proxy"""
     monthly = df_sub.resample('MS', on='timestamp').agg({
         'Quantity_Sold': 'sum',
         'Unit_Price': 'mean',
-        'Rating': 'mean'  # Added for ratings aggregation
+        'Rating': 'mean'
     }).reset_index()
     monthly['Revenue'] = (monthly['Quantity_Sold'].fillna(0) * monthly['Unit_Price'].fillna(0)).astype(float)
     return monthly[['timestamp', 'Quantity_Sold', 'Revenue', 'Rating']]
@@ -108,7 +128,7 @@ def build_seasonality(df_sub):
             heat.append({'year': int(yr), 'month': int(m), 'value': int(row.get(m, 0))})
     return heat
 
-# ------------- New Utilities for Ratings Graphs -------------
+# ------------- Utilities for Ratings Graphs -------------
 
 def average_rating_trend(df_sub):
     monthly = aggregate_monthly(df_sub)
@@ -145,7 +165,7 @@ def ratings_vs_sales_scatter(df_sub):
 def top_rated_products(df_sub):
     grouped = df_sub.groupby(['Brand', 'Product_Name', 'Model']).agg({
         'Rating': 'mean',
-        'Quantity_Sold': 'count'  # For weighting if needed
+        'Quantity_Sold': 'count'
     }).reset_index()
     grouped = grouped.sort_values('Rating', ascending=False).head(10)
     labels = grouped.apply(lambda row: f"{row['Brand']} {row['Product_Name']} ({row['Model']})", axis=1).tolist()
@@ -182,12 +202,12 @@ def sentiment_breakdown(df_sub):
 
 # ------------- ML Utilities for Buy/Not Buy -------------
 
-def prepare_ml_data(df):
+def prepare_ml_data(df_input):
     """Simplified feature engineering with consistent features"""
-    if df.empty:
+    if df_input.empty:
         return None, None, None, None
     
-    df_ml = df.dropna(subset=['Rating', 'Quantity_Sold']).copy()
+    df_ml = df_input.dropna(subset=['Rating', 'Quantity_Sold']).copy()
     if len(df_ml) < 10:  # Need minimum samples
         return None, None, None, None
     
@@ -222,7 +242,6 @@ def train_buy_classifier():
             logger.warning("Insufficient training samples.")
             return False
         
-        # Train RandomForest with basic parameters
         clf = RandomForestClassifier(
             n_estimators=50,
             random_state=42,
@@ -247,7 +266,7 @@ def train_buy_classifier():
 
 def load_or_train_classifier():
     """Load existing model or train new one"""
-    global clf
+    global clf, df
     
     try:
         # Try loading existing model first
@@ -255,20 +274,19 @@ def load_or_train_classifier():
         logger.info("[ML] Loaded existing buy classifier")
         return True
     except FileNotFoundError:
-        # Train new model if none exists
-        success = train_buy_classifier()
-        if success:
-            logger.info("[ML] Trained new buy classifier")
-        return success
+        logger.info("[ML] Existing model not found. Training new one.")
+        return train_buy_classifier()
     except Exception as e:
         logger.error(f"Error loading ML model: {e}")
-        # Fallback to training new model
         return train_buy_classifier()
 
 def get_buy_prediction(sub, user_budget=None, user_priority='balanced'):
     """Generate buy prediction with consistent features"""
     global clf, df
     
+    if clf is None:
+        load_or_train_classifier()
+        
     if clf is None or sub.empty:
         return None, 'Model not available'
     
@@ -281,7 +299,6 @@ def get_buy_prediction(sub, user_budget=None, user_priority='balanced'):
         if pd.isna(avg_rating) or pd.isna(total_qty):
             return None, 'Insufficient data for prediction'
         
-        # Prepare features for prediction (matching training features)
         X_pred = pd.DataFrame({
             'Rating': [avg_rating],
             'Quantity_Sold': [total_qty]
@@ -428,19 +445,19 @@ def select_best_model(monthly_sales, steps=6):
     comparison = [{'name': c['name'], 'rmse': c['rmse'], 'preview': [int(round(v)) for v in c['pred']]} for c in candidates_sorted]
     return best['pred'], best['name'], best['conf'], comparison
 
-# ---------------- Routes ----------------
+# ---------------- Routes as functions for factory ----------------
 
-def index():
+def index_view():
     return render_template('index.html', brands=brands, min_date=min_date_str, max_date=max_date_str)
 
-def get_products_for_brand(brand):
+def get_products_for_brand_view(brand):
     if df.empty:
         return jsonify([])
     subset = df[df['Brand'].astype(str) == str(brand)]
     products = subset['Product_Name'].dropna().astype(str).unique().tolist()
     return jsonify(sorted(products))
 
-def get_models_for_product(brand, product):
+def get_models_for_product_view(brand, product):
     if df.empty:
         return jsonify([])
     subset = df[
@@ -450,12 +467,12 @@ def get_models_for_product(brand, product):
     models = subset['Model'].dropna().astype(str).unique().tolist()
     return jsonify(sorted(models))
 
-def forecast_api():
+def forecast_api_view():
     global df, data_version
     try:
         # Check if data needs reloading
         old_version = data_version
-        df = load_sales_data()
+        load_sales_data()
         
         # Retrain model if data changed
         if data_version != old_version:
@@ -502,7 +519,7 @@ def forecast_api():
         last_date = monthly['timestamp'].iloc[-1]
         f_dates = pd.date_range(last_date + pd.offsets.MonthBegin(1), periods=steps, freq='MS')
 
-        # Revenue forecast proxy: mean Unit_Price of selected data
+        # Revenue forecast proxy
         last_price_series = sub['Unit_Price'].dropna().astype(float)
         price_proxy = float(last_price_series.mean()) if len(last_price_series) else 0.0
         f_revenue = (np.array(pred) * price_proxy).tolist()
@@ -536,7 +553,7 @@ def forecast_api():
         logger.exception("forecast_api error")
         return jsonify({'error': str(e)}), 500
 
-def model_comparison():
+def model_comparison_view():
     try:
         data = request.get_json() or {}
         for k in ['brand', 'product', 'model', 'start_date', 'end_date']:
@@ -588,14 +605,12 @@ def model_comparison():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ------------- Enhanced Route for Ratings Graphs -------------
-
-def ratings_api():
+def ratings_api_view():
     global df, clf, data_version
     try:
         # Check if data needs reloading
         old_version = data_version
-        df = load_sales_data()
+        load_sales_data()
         
         # Retrain model if data changed
         if data_version != old_version:
@@ -606,7 +621,6 @@ def ratings_api():
             if not data.get(k):
                 return jsonify({'error': f'Missing field: {k}'}), 400
 
-        # Get personalization inputs
         user_budget = float(data.get('budget', 0)) if data.get('budget') else None
         user_priority = data.get('priority', 'balanced')
 
@@ -652,14 +666,12 @@ def ratings_api():
         logger.exception("ratings_api error")
         return jsonify({'error': str(e)}), 500
 
-# ------------- New Route for Combined Recommendation -------------
-
-def recommendation_api():
+def recommendation_api_view():
     global df, clf, data_version
     try:
         # Check if data needs reloading
         old_version = data_version
-        df = load_sales_data()
+        load_sales_data()
         
         # Retrain model if data changed
         if data_version != old_version:
@@ -716,9 +728,7 @@ def recommendation_api():
         logger.exception("recommendation_api error")
         return jsonify({'error': str(e)}), 500
 
-# ---------------- Health Check Route ----------------
-
-def health_check():
+def health_check_view():
     """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
@@ -732,25 +742,24 @@ def health_check():
 def create_app():
     app = Flask(__name__)
     
-    # Add any app configurations here
-    # For example:
-    # app.config['DEBUG'] = True
-    # app.config.from_object('config')  # If you have a config file
+    # Reload data for the app factory instance
+    load_sales_data()
 
-    # Register routes using add_url_rule (since routes are defined as functions)
-    app.add_url_rule('/', view_func=index)
-    app.add_url_rule('/api/products/<brand>', view_func=get_products_for_brand)
-    app.add_url_rule('/api/models/<brand>/<product>', view_func=get_models_for_product)
-    app.add_url_rule('/api/forecast', view_func=forecast_api, methods=['POST'])
-    app.add_url_rule('/api/model-comparison', view_func=model_comparison, methods=['POST'])
-    app.add_url_rule('/api/ratings', view_func=ratings_api, methods=['POST'])
-    app.add_url_rule('/api/recommendation', view_func=recommendation_api, methods=['POST'])
-    app.add_url_rule('/api/health', view_func=health_check)
+    # Register routes
+    app.add_url_rule('/', view_func=index_view)
+    app.add_url_rule('/api/products/<brand>', view_func=get_products_for_brand_view)
+    app.add_url_rule('/api/models/<brand>/<product>', view_func=get_models_for_product_view)
+    app.add_url_rule('/api/forecast', view_func=forecast_api_view, methods=['POST'])
+    app.add_url_rule('/api/model-comparison', view_func=model_comparison_view, methods=['POST'])
+    app.add_url_rule('/api/ratings', view_func=ratings_api_view, methods=['POST'])
+    app.add_url_rule('/api/recommendation', view_func=recommendation_api_view, methods=['POST'])
+    app.add_url_rule('/api/health', view_func=health_check_view)
     
     return app
 
 # ---------------- Main ----------------
 
 if __name__ == '__main__':
-    app = create_app()
-    app.run(debug=True)
+    app_instance = create_app()
+    port = int(os.environ.get('PORT', 5000))
+    app_instance.run(host='0.0.0.0', port=port, debug=True)
